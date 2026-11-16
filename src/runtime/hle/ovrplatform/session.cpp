@@ -123,11 +123,16 @@ struct Graph {
 Result entitlement_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
   return p.entitlement(stop);
 }
-Result user_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
+Result user_handler(Provider& p, const RequestArgs&, std::stop_token stop, bool response_hooks) {
   auto r = p.logged_in_user(stop);
   if (!r.error && !r.user.id) r.error = failure(ErrorCode::invalid_response);
   if (!r.error && r.model.kind.empty())
     r.model = user_model(r.user.id, r.user.alias, r.user.display_name);
+  // Response hooks can replace User getters but cannot construct Meta's opaque
+  // native model. Keep the service error while giving that tooling an empty
+  // object to materialize; ordinary launches still receive no user payload.
+  if (response_hooks && r.error.code == ErrorCode::unauthenticated && r.model.kind.empty())
+    r.model = user_model(0, {}, {});
   return r;
 }
 Result token_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
@@ -249,10 +254,13 @@ struct Session::Impl {
   std::jthread presence_worker;
   std::vector<std::jthread> workers;
 
-  Impl(AppIdentity a, std::shared_ptr<Provider> p, Memory m)
+  Impl(AppIdentity a, std::shared_ptr<Provider> p, Memory m, bool response_hooks)
       : app(std::move(a)), provider(std::move(p)), memory(std::move(m)) {
     handlers.emplace("ovr_Entitlement_GetIsViewerEntitled", HandlerSpec{entitlement_handler, ""});
-    handlers.emplace("ovr_User_GetLoggedInUser", HandlerSpec{user_handler, "User"});
+    handlers.emplace("ovr_User_GetLoggedInUser", HandlerSpec{
+        [response_hooks](Provider& provider, const RequestArgs& args, std::stop_token stop) {
+          return user_handler(provider, args, stop, response_hooks);
+        }, "User"});
     handlers.emplace("ovr_User_GetAccessToken", HandlerSpec{token_handler, "String"});
     handlers.emplace("ovr_User_GetUserProof", HandlerSpec{proof_handler, "UserProof"});
     std::random_device random;
@@ -547,8 +555,8 @@ struct Session::Impl {
     return it != nodes.end() && it->second->kind == kind ? it->second : nullptr;
   }
 };
-Session::Session(AppIdentity a, std::shared_ptr<Provider> p, Memory m)
-    : impl_(std::make_unique<Impl>(std::move(a), std::move(p), std::move(m))) {
+Session::Session(AppIdentity a, std::shared_ptr<Provider> p, Memory m, bool response_hooks)
+    : impl_(std::make_unique<Impl>(std::move(a), std::move(p), std::move(m), response_hooks)) {
   register_social_handlers(*this);
 }
 Session::~Session() { shutdown(); }
@@ -737,7 +745,7 @@ Handle Session::pop() {
   if (c.init)
     payload = graph->node({Kind::init, static_cast<std::uint64_t>(init_error(c.result.error))},
                           impl_->serial++);
-  else if (!error && !c.result.model.kind.empty())
+  else if (!c.result.model.kind.empty())
     payload = graph->model(c.result.model, impl_->serial);
   Handle string = 0;
   if (!error && c.result.model.kind == "String") {
@@ -803,7 +811,7 @@ std::uint64_t Session::get(Handle h, std::string_view name, std::uint64_t index)
     if (name == "ovr_Message_GetNativeMessage") return h;
     if (name == "ovr_Message_GetPlatformInitialize")
       return impl_->find(n->d, Kind::init) ? n->d : 0;
-    if (n->c || !name.starts_with("ovr_Message_Get")) return 0;
+    if (!name.starts_with("ovr_Message_Get")) return 0;
     auto* payload = impl_->find(n->d, Kind::model);
     return payload && payload->option_kind == name.substr(15) ? n->d : 0;
   }

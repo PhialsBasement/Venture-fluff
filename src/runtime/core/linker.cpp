@@ -95,6 +95,10 @@ GuestIsa HleLibrary::isa() const {
 void HleLibrary::set_backing(std::shared_ptr<elf::Image> image) {
   std::lock_guard lock(impl_->mutex);
   if (image) { image->owner = this; image->group_root = group_root; global |= image->global; nodelete |= image->nodelete; }
+  for (const auto& name : impl_->functions) {
+    if (!image || impl_->absent.contains(name)) continue;
+    image->retarget_export(name, impl_->symbols.at(name));
+  }
   load_bias = image ? image->load_bias : 0;
   phdr = image ? image->phdr : 0; phnum = image ? image->phnum : 0;
   map_start = image ? image->map_start : 0; map_size = image ? image->map_size : 0;

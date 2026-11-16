@@ -1065,6 +1065,11 @@ TEST_CASE("a game that asked Meta for its user without a sign-in is recognised f
   CHECK(library::needed_meta_sign_in(write("entitlement.log",
       "  1.0 1 I [launch] Process started\n  2.0 1 W [ovrplatform] ovr_Entitlement_GetIsViewerEntitled "
       "request=2 type=0x186b58b1 error=-20001\n")));
+  CHECK_FALSE(library::needed_meta_sign_in(write("survived-entitlement.log",
+      "  1.0 1 I [launch] Process started\n"
+      "  2.0 1 W [ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=2 type=0x186b58b1 error=-20001\n"
+      "  3.0 1 I [xr] Frames submitted=60 xrEndFrame_errors=0 submission_fps=72.00 runtime_period_hz=72.00\n"
+      "  4.0 1 I [launch] Exit code: 0\n")));
   CHECK_FALSE(library::needed_meta_sign_in(write("other.log",
       "  2.0 1 W [ovrplatform] ovr_User_GetLoggedInUser request=1 type=0x436f345d error=-20003\n"
       "  3.0 1 W [ovrplatform] ovr_Leaderboard_Get request=4 type=0x1 error=-20001\n")));

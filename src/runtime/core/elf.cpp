@@ -400,6 +400,26 @@ GuestAddr Image::find_symbol(std::string_view name, std::string_view version) co
   }
   return sym->shndx == 0xfff1 ? sym->value : load_bias + sym->value;
 }
+void Image::retarget_export(std::string_view name, GuestAddr target) {
+  constexpr std::int64_t dt_symtab = 6;
+  constexpr std::uint16_t shn_abs = 0xfff1;
+  auto it = exports_.find(std::string(name));
+  if (it == exports_.end()) return;
+  for (auto index : it->second) {
+    const auto value = symbols_[index].shndx == shn_abs ? target : target - load_bias;
+    if (isa_ == GuestIsa::a32) {
+      Sym32 symbol;
+      const auto at = address(dynamic(dt_symtab) + index * sizeof(symbol), sizeof(symbol));
+      std::memcpy(&symbol, g2h(at), sizeof(symbol));
+      symbol.value = static_cast<std::uint32_t>(value);
+      std::memcpy(g2h(at), &symbol, sizeof(symbol));
+      symbols32_[index].value = symbol.value;
+      continue;
+    }
+    auto* symbol = g2h<Sym>(address(dynamic(dt_symtab) + index * sizeof(Sym), sizeof(Sym)));
+    symbol->value = value;
+  }
+}
 void Image::relocations(const std::function<void(const Rela&)>& visit) {
   if (isa_ == GuestIsa::a32) {
     if (dynamic(8) || dynamic(0x60000012))

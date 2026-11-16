@@ -65,7 +65,13 @@ std::size_t prepare_java_script_loaders(
     // Script.evaluate preserves the original program's directive prologue,
     // global declarations and source name; concatenating a prelude would not.
     const std::string wrapper = std::string(hosted_java_source) +
-        "\nScript.evaluate(" + Json(script_name).dump(-1, ' ', true) + "," + source_literal + ");\n";
+        "\nScript.evaluate(" + Json(script_name).dump(-1, ' ', true) + "," + source_literal + ");\n"
+        // A bundled frida-java-bridge expects ART. Use the hosted JVM when that
+        // private bridge is unavailable, before Gadget invokes rpc.exports.init.
+        "if (typeof frida_java_bridge_default !== 'undefined') {\n"
+        "  try { if (!frida_java_bridge_default.available) frida_java_bridge_default = Java; }\n"
+        "  catch (_) { frida_java_bridge_default = Java; }\n"
+        "}\n";
     const auto wrapper_name = name + ".venture-java-" + hash(wrapper) + ".js";
     const auto wrapper_path = config_path.parent_path() / paths::from_utf8(wrapper_name);
     if (!std::filesystem::is_regular_file(paths::io_path(wrapper_path)) ||

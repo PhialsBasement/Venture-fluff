@@ -1,0 +1,389 @@
+diff --git a/src/common/library/library.cpp b/src/common/library/library.cpp
+index 3199299..b7b1079 100644
+--- a/src/common/library/library.cpp
++++ b/src/common/library/library.cpp
+@@ -491,8 +491,8 @@ std::vector<std::string> missing_expansions(const Install &install) {
+ }
+ bool needed_meta_sign_in(const fs::path &log) {
+   std::ifstream in(log, std::ios::binary);
+-  bool init_failed = false, crashed_on_reply = false;
+-  unsigned long long frames = 0;
++  bool init_failed = false, crashed_on_reply = false, direct_auth_failed = false;
++  unsigned long long frames = 0, direct_auth_frames = 0;
+   double last = 0, refused = -1, first_poll = -1;
+   // The newest log lines, true for each one that is an unanswered user poll.
+   std::deque<bool> recent;
+@@ -507,9 +507,13 @@ bool needed_meta_sign_in(const fs::path &log) {
+       recent.push_back(poll);
+       if (recent.size() > 200) recent.pop_front();
+     }
+-    if (line.find("[ovrplatform] ovr_User_GetLoggedInUser request=") != std::string::npos ||
+-        line.find("[ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=") != std::string::npos)
+-      if (line.find(" error=-20001") != std::string::npos) return true;
++    const bool direct_auth_request =
++        line.find("[ovrplatform] ovr_User_GetLoggedInUser request=") != std::string::npos ||
++        line.find("[ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=") != std::string::npos;
++    if (direct_auth_request && line.find(" error=-20001") != std::string::npos && !direct_auth_failed) {
++      direct_auth_failed = true;
++      direct_auth_frames = frames;
++    }
+     // Synchronous initialization logs its own line; the asynchronous one
+     // completes as an ordinary request.
+     if (line.find("[ovrplatform] initialization failed error=-20001") != std::string::npos ||
+@@ -531,7 +535,13 @@ bool needed_meta_sign_in(const fs::path &log) {
+   // asking for the user (Pinball FX shows black and polls ~45 times a second).
+   const auto polls = std::count(recent.begin(), recent.end(), true);
+   const bool waiting_for_user = recent.size() == 200 && polls >= 180 && last - first_poll >= 30;
+-  return init_failed && (frames < 10 || crashed_on_reply || waiting_for_user);
++  // Response hooks may mask an error and supply the payload the game needs.
++  // Another 60 submitted frames prove that the game got past the direct error;
++  // do not blame its later, unrelated exit on the error it survived.
++  constexpr unsigned long long frames_proving_survival = 60;
++  const bool direct_unanswered = direct_auth_failed &&
++      (frames <= direct_auth_frames || frames - direct_auth_frames < frames_proving_survival);
++  return direct_unanswered || (init_failed && (frames < 10 || crashed_on_reply || waiting_for_user));
+ }
+ bool refused_entitlement(const fs::path &log) {
+   std::ifstream in(log, std::ios::binary);
+diff --git a/src/runtime/core/elf.cpp b/src/runtime/core/elf.cpp
+index f204383..cbc5d29 100644
+--- a/src/runtime/core/elf.cpp
++++ b/src/runtime/core/elf.cpp
+@@ -400,6 +400,26 @@ GuestAddr Image::find_symbol(std::string_view name, std::string_view version) co
+   }
+   return sym->shndx == 0xfff1 ? sym->value : load_bias + sym->value;
+ }
++void Image::retarget_export(std::string_view name, GuestAddr target) {
++  constexpr std::int64_t dt_symtab = 6;
++  constexpr std::uint16_t shn_abs = 0xfff1;
++  auto it = exports_.find(std::string(name));
++  if (it == exports_.end()) return;
++  for (auto index : it->second) {
++    const auto value = symbols_[index].shndx == shn_abs ? target : target - load_bias;
++    if (isa_ == GuestIsa::a32) {
++      Sym32 symbol;
++      const auto at = address(dynamic(dt_symtab) + index * sizeof(symbol), sizeof(symbol));
++      std::memcpy(&symbol, g2h(at), sizeof(symbol));
++      symbol.value = static_cast<std::uint32_t>(value);
++      std::memcpy(g2h(at), &symbol, sizeof(symbol));
++      symbols32_[index].value = symbol.value;
++      continue;
++    }
++    auto* symbol = g2h<Sym>(address(dynamic(dt_symtab) + index * sizeof(Sym), sizeof(Sym)));
++    symbol->value = value;
++  }
++}
+ void Image::relocations(const std::function<void(const Rela&)>& visit) {
+   if (isa_ == GuestIsa::a32) {
+     if (dynamic(8) || dynamic(0x60000012))
+diff --git a/src/runtime/core/elf.h b/src/runtime/core/elf.h
+index dda64d5..992f1a3 100644
+--- a/src/runtime/core/elf.h
++++ b/src/runtime/core/elf.h
+@@ -87,6 +87,8 @@ class Image final : public Library {
+   const std::filesystem::path& source_file() const { return source_file_; }
+   Image* mapped_image() const override { return const_cast<Image*>(this); }
+   GuestAddr find_symbol(std::string_view name, std::string_view version = {}) const override;
++  // Makes raw guest ELF lookups agree with an HLE replacement for this export.
++  void retarget_export(std::string_view name, GuestAddr target);
+   const Sym* lookup(std::string_view name, std::string_view version = {}) const;
+   std::string symbol_name(const Sym& symbol) const;
+   SymbolVersion symbol_version(std::size_t index) const;
+diff --git a/src/runtime/core/java_script_loader.cpp b/src/runtime/core/java_script_loader.cpp
+index 6e98186..67d4f7f 100644
+--- a/src/runtime/core/java_script_loader.cpp
++++ b/src/runtime/core/java_script_loader.cpp
+@@ -65,7 +65,13 @@ std::size_t prepare_java_script_loaders(
+     // Script.evaluate preserves the original program's directive prologue,
+     // global declarations and source name; concatenating a prelude would not.
+     const std::string wrapper = std::string(hosted_java_source) +
+-        "\nScript.evaluate(" + Json(script_name).dump(-1, ' ', true) + "," + source_literal + ");\n";
++        "\nScript.evaluate(" + Json(script_name).dump(-1, ' ', true) + "," + source_literal + ");\n"
++        // A bundled frida-java-bridge expects ART. Use the hosted JVM when that
++        // private bridge is unavailable, before Gadget invokes rpc.exports.init.
++        "if (typeof frida_java_bridge_default !== 'undefined') {\n"
++        "  try { if (!frida_java_bridge_default.available) frida_java_bridge_default = Java; }\n"
++        "  catch (_) { frida_java_bridge_default = Java; }\n"
++        "}\n";
+     const auto wrapper_name = name + ".venture-java-" + hash(wrapper) + ".js";
+     const auto wrapper_path = config_path.parent_path() / paths::from_utf8(wrapper_name);
+     if (!std::filesystem::is_regular_file(paths::io_path(wrapper_path)) ||
+diff --git a/src/runtime/core/linker.cpp b/src/runtime/core/linker.cpp
+index 45e25c9..d214cf9 100644
+--- a/src/runtime/core/linker.cpp
++++ b/src/runtime/core/linker.cpp
+@@ -95,6 +95,10 @@ GuestIsa HleLibrary::isa() const {
+ void HleLibrary::set_backing(std::shared_ptr<elf::Image> image) {
+   std::lock_guard lock(impl_->mutex);
+   if (image) { image->owner = this; image->group_root = group_root; global |= image->global; nodelete |= image->nodelete; }
++  for (const auto& name : impl_->functions) {
++    if (!image || impl_->absent.contains(name)) continue;
++    image->retarget_export(name, impl_->symbols.at(name));
++  }
+   load_bias = image ? image->load_bias : 0;
+   phdr = image ? image->phdr : 0; phnum = image ? image->phnum : 0;
+   map_start = image ? image->map_start : 0; map_size = image ? image->map_size : 0;
+diff --git a/src/runtime/hle/openxr/sphere_layers.cpp b/src/runtime/hle/openxr/sphere_layers.cpp
+index 7e8205c..f6c0d2f 100644
+--- a/src/runtime/hle/openxr/sphere_layers.cpp
++++ b/src/runtime/hle/openxr/sphere_layers.cpp
+@@ -13,6 +13,7 @@
+ #include <numbers>
+ #include <set>
+ #include <tuple>
++#include <utility>
+ 
+ namespace venture::hle::openxr {
+ namespace {
+diff --git a/src/runtime/hle/ovrplatform/library.cpp b/src/runtime/hle/ovrplatform/library.cpp
+index c74b01e..b60ef8c 100644
+--- a/src/runtime/hle/ovrplatform/library.cpp
++++ b/src/runtime/hle/ovrplatform/library.cpp
+@@ -48,7 +48,7 @@ std::unique_ptr<Session> make_runtime_session(
+   };
+   auto session = std::make_unique<Session>(
+       app, std::move(provider),
+-      std::move(memory));
++      std::move(memory), process_config().embedded_java_scripts);
+   ProgressionPolicy policy;
+   policy.leaderboard_writes = process_config().platform_leaderboard_writes;
+   register_progression_handlers(*session, policy);
+diff --git a/src/runtime/hle/ovrplatform/session.cpp b/src/runtime/hle/ovrplatform/session.cpp
+index d8c62b9..8607ec5 100644
+--- a/src/runtime/hle/ovrplatform/session.cpp
++++ b/src/runtime/hle/ovrplatform/session.cpp
+@@ -123,11 +123,16 @@ struct Graph {
+ Result entitlement_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
+   return p.entitlement(stop);
+ }
+-Result user_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
++Result user_handler(Provider& p, const RequestArgs&, std::stop_token stop, bool response_hooks) {
+   auto r = p.logged_in_user(stop);
+   if (!r.error && !r.user.id) r.error = failure(ErrorCode::invalid_response);
+   if (!r.error && r.model.kind.empty())
+     r.model = user_model(r.user.id, r.user.alias, r.user.display_name);
++  // Response hooks can replace User getters but cannot construct Meta's opaque
++  // native model. Keep the service error while giving that tooling an empty
++  // object to materialize; ordinary launches still receive no user payload.
++  if (response_hooks && r.error.code == ErrorCode::unauthenticated && r.model.kind.empty())
++    r.model = user_model(0, {}, {});
+   return r;
+ }
+ Result token_handler(Provider& p, const RequestArgs&, std::stop_token stop) {
+@@ -249,10 +254,13 @@ struct Session::Impl {
+   std::jthread presence_worker;
+   std::vector<std::jthread> workers;
+ 
+-  Impl(AppIdentity a, std::shared_ptr<Provider> p, Memory m)
++  Impl(AppIdentity a, std::shared_ptr<Provider> p, Memory m, bool response_hooks)
+       : app(std::move(a)), provider(std::move(p)), memory(std::move(m)) {
+     handlers.emplace("ovr_Entitlement_GetIsViewerEntitled", HandlerSpec{entitlement_handler, ""});
+-    handlers.emplace("ovr_User_GetLoggedInUser", HandlerSpec{user_handler, "User"});
++    handlers.emplace("ovr_User_GetLoggedInUser", HandlerSpec{
++        [response_hooks](Provider& provider, const RequestArgs& args, std::stop_token stop) {
++          return user_handler(provider, args, stop, response_hooks);
++        }, "User"});
+     handlers.emplace("ovr_User_GetAccessToken", HandlerSpec{token_handler, "String"});
+     handlers.emplace("ovr_User_GetUserProof", HandlerSpec{proof_handler, "UserProof"});
+     std::random_device random;
+@@ -547,8 +555,8 @@ struct Session::Impl {
+     return it != nodes.end() && it->second->kind == kind ? it->second : nullptr;
+   }
+ };
+-Session::Session(AppIdentity a, std::shared_ptr<Provider> p, Memory m)
+-    : impl_(std::make_unique<Impl>(std::move(a), std::move(p), std::move(m))) {
++Session::Session(AppIdentity a, std::shared_ptr<Provider> p, Memory m, bool response_hooks)
++    : impl_(std::make_unique<Impl>(std::move(a), std::move(p), std::move(m), response_hooks)) {
+   register_social_handlers(*this);
+ }
+ Session::~Session() { shutdown(); }
+@@ -737,7 +745,7 @@ Handle Session::pop() {
+   if (c.init)
+     payload = graph->node({Kind::init, static_cast<std::uint64_t>(init_error(c.result.error))},
+                           impl_->serial++);
+-  else if (!error && !c.result.model.kind.empty())
++  else if (!c.result.model.kind.empty())
+     payload = graph->model(c.result.model, impl_->serial);
+   Handle string = 0;
+   if (!error && c.result.model.kind == "String") {
+@@ -803,7 +811,7 @@ std::uint64_t Session::get(Handle h, std::string_view name, std::uint64_t index)
+     if (name == "ovr_Message_GetNativeMessage") return h;
+     if (name == "ovr_Message_GetPlatformInitialize")
+       return impl_->find(n->d, Kind::init) ? n->d : 0;
+-    if (n->c || !name.starts_with("ovr_Message_Get")) return 0;
++    if (!name.starts_with("ovr_Message_Get")) return 0;
+     auto* payload = impl_->find(n->d, Kind::model);
+     return payload && payload->option_kind == name.substr(15) ? n->d : 0;
+   }
+diff --git a/src/runtime/hle/ovrplatform/session.h b/src/runtime/hle/ovrplatform/session.h
+index 2239e8f..d209db8 100644
+--- a/src/runtime/hle/ovrplatform/session.h
++++ b/src/runtime/hle/ovrplatform/session.h
+@@ -46,7 +46,7 @@ struct StartupPlatformState {
+ // until shutdown). Accessors validate handle kind before using host state.
+ class Session {
+  public:
+-  Session(AppIdentity, std::shared_ptr<Provider>, Memory);
++  Session(AppIdentity, std::shared_ptr<Provider>, Memory, bool response_hooks = false);
+   ~Session();
+   Session(const Session&) = delete;
+   Session& operator=(const Session&) = delete;
+diff --git a/tests/runtime/java_script_loader_test.cpp b/tests/runtime/java_script_loader_test.cpp
+index 5c60981..587fc61 100644
+--- a/tests/runtime/java_script_loader_test.cpp
++++ b/tests/runtime/java_script_loader_test.cpp
+@@ -39,6 +39,8 @@ TEST_CASE("restored APK configuration regenerates stable startup support and rep
+   REQUIRE(f.prepare() == 1);
+   const auto wrapper_path = f.wrapper();
+   const auto original_wrapper = paths::read(wrapper_path);
++  CHECK(original_wrapper.find("if (!frida_java_bridge_default.available) frida_java_bridge_default = Java;") != std::string::npos);
++  CHECK(original_wrapper.find("catch (_) { frida_java_bridge_default = Java; }") != std::string::npos);
+   f.save(); // normal extraction restores the original CRC-verified configuration
+   REQUIRE(f.prepare() == 1);
+   CHECK(f.wrapper() == wrapper_path);
+diff --git a/tests/runtime/output_mirror_test.cpp b/tests/runtime/output_mirror_test.cpp
+index 4430f5a..e053930 100644
+--- a/tests/runtime/output_mirror_test.cpp
++++ b/tests/runtime/output_mirror_test.cpp
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <functional>
+ #include <vector>
+ 
+ #include "audio/output_mirror.h"
+diff --git a/tests/runtime/ovrplatform_test.cpp b/tests/runtime/ovrplatform_test.cpp
+index df54e09..9c19479 100644
+--- a/tests/runtime/ovrplatform_test.cpp
++++ b/tests/runtime/ovrplatform_test.cpp
+@@ -444,6 +444,31 @@ TEST_CASE("Platform Unity native-message unwrap preserves user and proof payload
+   }
+ }
+ 
++TEST_CASE("Platform embedded response hooks can materialize an empty user without hiding the service error") {
++  optest::Arena arena;
++  auto provider = std::make_shared<optest::FakeProvider>();
++  provider->user_error = failure(ErrorCode::unauthenticated);
++  auto request_user = [&](Session& session) {
++    optest::invoke(session, "ovr_User_GetLoggedInUser");
++    return optest::wait_pop(session);
++  };
++  Session ordinary_session(optest::app(), provider, arena.memory());
++  REQUIRE(ordinary_session.initialize(optest::app().app_id) == InitResult::success);
++  const auto ordinary = request_user(ordinary_session);
++  CHECK(ordinary_session.get(ordinary, "ovr_Message_IsError") == 1);
++  CHECK(ordinary_session.get(ordinary, "ovr_Message_GetUser") == 0);
++  ordinary_session.free_message(ordinary);
++  Session hooked_session(optest::app(), provider, arena.memory(), true);
++  REQUIRE(hooked_session.initialize(optest::app().app_id) == InitResult::success);
++  const auto hooked = request_user(hooked_session);
++  CHECK(hooked_session.get(hooked, "ovr_Message_IsError") == 1);
++  const auto user = hooked_session.get(hooked, "ovr_Message_GetUser");
++  REQUIRE(user != 0);
++  CHECK(hooked_session.get(user, "ovr_User_GetID") == 0);
++  hooked_session.free_message(hooked);
++  CHECK(arena.live == 0);
++}
++
+ TEST_CASE("Platform enum ToString and FromString use the SDK's names") {
+   optest::Arena arena;
+   Session session(optest::app(), std::make_shared<optest::FakeProvider>(), arena.memory());
+diff --git a/tests/runtime/replacement_exports_test.cpp b/tests/runtime/replacement_exports_test.cpp
+index cb601bd..5b07104 100644
+--- a/tests/runtime/replacement_exports_test.cpp
++++ b/tests/runtime/replacement_exports_test.cpp
+@@ -1,5 +1,6 @@
+ #include "core/address_space.h"
+ #include "core/elf.h"
++#include "core/a32_abi.h"
+ #include "core/hle_runtime.h"
+ #include "core/guest_storage.h"
+ #include "hle/libc/libc_parts.h"
+@@ -168,7 +169,70 @@ struct ReplacementFixture {
+     out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+   }
+ };
++// Frida resolves module exports from the guest ELF, not through Linker::symbol.
++GuestAddr guest_export_address(elf::Image& image, std::string_view name) {
++  constexpr std::int64_t dt_symtab = 6;
++  for (std::size_t i = 0; i < image.symbols().size(); ++i) {
++    if (image.symbol_name(image.symbol_at(i)) != name) continue;
++    if (image.isa() == GuestIsa::a32) {
++      elf::Sym32 symbol;
++      const auto at = image.address(image.dynamic(dt_symtab) + i * sizeof(symbol), sizeof(symbol));
++      std::memcpy(&symbol, g2h(at), sizeof(symbol));
++      return image.load_bias + symbol.value;
++    }
++    elf::Sym symbol;
++    const auto at = image.address(image.dynamic(dt_symtab) + i * sizeof(symbol), sizeof(symbol));
++    std::memcpy(&symbol, g2h(at), sizeof(symbol));
++    return image.load_bias + symbol.value;
++  }
++  return 0;
++}
+ } // namespace
++TEST_CASE("replacement exports give Frida the same override address as the linker") {
++#ifdef VENTURE_REPLACEMENT_FIXTURE_A32
++  select_process_isa(GuestIsa::a32);
++#endif
++  AddressSpace::get().initialize(process_config().isa());
++  auto dir = std::filesystem::current_path() / "build/replacement-export-parity" /
++             (process_config().isa() == GuestIsa::a32 ? "a32" : "a64");
++  std::filesystem::create_directories(dir);
++  constexpr unsigned original_override_result = 105;
++  constexpr unsigned original_fallback_result = 106;
++  constexpr unsigned hle_override_result = 305;
++  constexpr std::string_view override_name = "ovr_Entitlement_GetIsViewerEntitled";
++  ReplacementFixture original;
++  original.function(override_name, original_override_result);
++  original.function("JNI_OnLoad", original_fallback_result);
++  original.write(dir / "libovrplatformloader.so");
++  auto hle = std::make_shared<HleLibrary>("libovrplatformloader.so");
++  hle::Handler override_handler = [](hle::CallContext &c) { c.return_x(hle_override_result); };
++#ifdef VENTURE_REPLACEMENT_FIXTURE_A32
++  hle::a32::register_adapter(hle->soname(), override_name, override_handler);
++#endif
++  const auto native = hle::make_thunk(hle->soname(), override_name, override_handler);
++  hle->add_function(override_name, native);
++  auto& linker = Linker::get();
++  linker.register_hle_library(hle);
++  linker.set_search_paths({dir.string()});
++  linker_set_inspection(false);
++  GuestThread thread(98);
++  thread.attach_to_current_host_thread();
++  auto* replacement = linker.open("libovrplatformloader.so", kRtldNow, nullptr);
++  REQUIRE(replacement != nullptr);
++  CHECK(replacement->mapped_image() == nullptr);
++  // The Java loader's JNI_OnLoad probe activates the backing before Gadget starts.
++  const auto fallback = linker.symbol(replacement, "JNI_OnLoad");
++  REQUIRE(fallback != 0);
++  auto* backing = replacement->mapped_image();
++  REQUIRE(backing != nullptr);
++  const auto frida_override = guest_export_address(*backing, override_name);
++  CHECK(linker.symbol(replacement, override_name) == native);
++  CHECK(frida_override == native);
++  CHECK(thread.call(frida_override, {}) == hle_override_result);
++  CHECK(guest_export_address(*backing, "JNI_OnLoad") == fallback);
++  CHECK(thread.call(fallback, {}) == original_fallback_result);
++  CHECK(linker.close(replacement) == 0);
++}
+ TEST_CASE("replacement exports preserve originals without unrelated C++ fallback") {
+ #ifdef VENTURE_REPLACEMENT_FIXTURE_A32
+   select_process_isa(GuestIsa::a32);
+diff --git a/tests/test_launcher.cpp b/tests/test_launcher.cpp
+index 5bfaddd..41ee17c 100644
+--- a/tests/test_launcher.cpp
++++ b/tests/test_launcher.cpp
+@@ -1065,6 +1065,11 @@ TEST_CASE("a game that asked Meta for its user without a sign-in is recognised f
+   CHECK(library::needed_meta_sign_in(write("entitlement.log",
+       "  1.0 1 I [launch] Process started\n  2.0 1 W [ovrplatform] ovr_Entitlement_GetIsViewerEntitled "
+       "request=2 type=0x186b58b1 error=-20001\n")));
++  CHECK_FALSE(library::needed_meta_sign_in(write("survived-entitlement.log",
++      "  1.0 1 I [launch] Process started\n"
++      "  2.0 1 W [ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=2 type=0x186b58b1 error=-20001\n"
++      "  3.0 1 I [xr] Frames submitted=60 xrEndFrame_errors=0 submission_fps=72.00 runtime_period_hz=72.00\n"
++      "  4.0 1 I [launch] Exit code: 0\n")));
+   CHECK_FALSE(library::needed_meta_sign_in(write("other.log",
+       "  2.0 1 W [ovrplatform] ovr_User_GetLoggedInUser request=1 type=0x436f345d error=-20003\n"
+       "  3.0 1 W [ovrplatform] ovr_Leaderboard_Get request=4 type=0x1 error=-20001\n")));

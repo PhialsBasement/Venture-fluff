@@ -87,6 +87,8 @@ class Image final : public Library {
   const std::filesystem::path& source_file() const { return source_file_; }
   Image* mapped_image() const override { return const_cast<Image*>(this); }
   GuestAddr find_symbol(std::string_view name, std::string_view version = {}) const override;
+  // Makes raw guest ELF lookups agree with an HLE replacement for this export.
+  void retarget_export(std::string_view name, GuestAddr target);
   const Sym* lookup(std::string_view name, std::string_view version = {}) const;
   std::string symbol_name(const Sym& symbol) const;
   SymbolVersion symbol_version(std::size_t index) const;

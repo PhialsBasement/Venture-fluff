@@ -46,7 +46,7 @@ struct StartupPlatformState {
 // until shutdown). Accessors validate handle kind before using host state.
 class Session {
  public:
-  Session(AppIdentity, std::shared_ptr<Provider>, Memory);
+  Session(AppIdentity, std::shared_ptr<Provider>, Memory, bool response_hooks = false);
   ~Session();
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;

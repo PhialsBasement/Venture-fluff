@@ -444,6 +444,31 @@ TEST_CASE("Platform Unity native-message unwrap preserves user and proof payload
   }
 }
 
+TEST_CASE("Platform embedded response hooks can materialize an empty user without hiding the service error") {
+  optest::Arena arena;
+  auto provider = std::make_shared<optest::FakeProvider>();
+  provider->user_error = failure(ErrorCode::unauthenticated);
+  auto request_user = [&](Session& session) {
+    optest::invoke(session, "ovr_User_GetLoggedInUser");
+    return optest::wait_pop(session);
+  };
+  Session ordinary_session(optest::app(), provider, arena.memory());
+  REQUIRE(ordinary_session.initialize(optest::app().app_id) == InitResult::success);
+  const auto ordinary = request_user(ordinary_session);
+  CHECK(ordinary_session.get(ordinary, "ovr_Message_IsError") == 1);
+  CHECK(ordinary_session.get(ordinary, "ovr_Message_GetUser") == 0);
+  ordinary_session.free_message(ordinary);
+  Session hooked_session(optest::app(), provider, arena.memory(), true);
+  REQUIRE(hooked_session.initialize(optest::app().app_id) == InitResult::success);
+  const auto hooked = request_user(hooked_session);
+  CHECK(hooked_session.get(hooked, "ovr_Message_IsError") == 1);
+  const auto user = hooked_session.get(hooked, "ovr_Message_GetUser");
+  REQUIRE(user != 0);
+  CHECK(hooked_session.get(user, "ovr_User_GetID") == 0);
+  hooked_session.free_message(hooked);
+  CHECK(arena.live == 0);
+}
+
 TEST_CASE("Platform enum ToString and FromString use the SDK's names") {
   optest::Arena arena;
   Session session(optest::app(), std::make_shared<optest::FakeProvider>(), arena.memory());

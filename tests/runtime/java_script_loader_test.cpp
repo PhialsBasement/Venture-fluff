@@ -39,6 +39,8 @@ TEST_CASE("restored APK configuration regenerates stable startup support and rep
   REQUIRE(f.prepare() == 1);
   const auto wrapper_path = f.wrapper();
   const auto original_wrapper = paths::read(wrapper_path);
+  CHECK(original_wrapper.find("if (!frida_java_bridge_default.available) frida_java_bridge_default = Java;") != std::string::npos);
+  CHECK(original_wrapper.find("catch (_) { frida_java_bridge_default = Java; }") != std::string::npos);
   f.save(); // normal extraction restores the original CRC-verified configuration
   REQUIRE(f.prepare() == 1);
   CHECK(f.wrapper() == wrapper_path);

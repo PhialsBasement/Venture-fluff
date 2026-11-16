@@ -48,7 +48,7 @@ std::unique_ptr<Session> make_runtime_session(
   };
   auto session = std::make_unique<Session>(
       app, std::move(provider),
-      std::move(memory));
+      std::move(memory), process_config().embedded_java_scripts);
   ProgressionPolicy policy;
   policy.leaderboard_writes = process_config().platform_leaderboard_writes;
   register_progression_handlers(*session, policy);

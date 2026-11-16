@@ -1,5 +1,6 @@
 #include "core/address_space.h"
 #include "core/elf.h"
+#include "core/a32_abi.h"
 #include "core/hle_runtime.h"
 #include "core/guest_storage.h"
 #include "hle/libc/libc_parts.h"
@@ -168,7 +169,70 @@ struct ReplacementFixture {
     out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
   }
 };
+// Frida resolves module exports from the guest ELF, not through Linker::symbol.
+GuestAddr guest_export_address(elf::Image& image, std::string_view name) {
+  constexpr std::int64_t dt_symtab = 6;
+  for (std::size_t i = 0; i < image.symbols().size(); ++i) {
+    if (image.symbol_name(image.symbol_at(i)) != name) continue;
+    if (image.isa() == GuestIsa::a32) {
+      elf::Sym32 symbol;
+      const auto at = image.address(image.dynamic(dt_symtab) + i * sizeof(symbol), sizeof(symbol));
+      std::memcpy(&symbol, g2h(at), sizeof(symbol));
+      return image.load_bias + symbol.value;
+    }
+    elf::Sym symbol;
+    const auto at = image.address(image.dynamic(dt_symtab) + i * sizeof(symbol), sizeof(symbol));
+    std::memcpy(&symbol, g2h(at), sizeof(symbol));
+    return image.load_bias + symbol.value;
+  }
+  return 0;
+}
 } // namespace
+TEST_CASE("replacement exports give Frida the same override address as the linker") {
+#ifdef VENTURE_REPLACEMENT_FIXTURE_A32
+  select_process_isa(GuestIsa::a32);
+#endif
+  AddressSpace::get().initialize(process_config().isa());
+  auto dir = std::filesystem::current_path() / "build/replacement-export-parity" /
+             (process_config().isa() == GuestIsa::a32 ? "a32" : "a64");
+  std::filesystem::create_directories(dir);
+  constexpr unsigned original_override_result = 105;
+  constexpr unsigned original_fallback_result = 106;
+  constexpr unsigned hle_override_result = 305;
+  constexpr std::string_view override_name = "ovr_Entitlement_GetIsViewerEntitled";
+  ReplacementFixture original;
+  original.function(override_name, original_override_result);
+  original.function("JNI_OnLoad", original_fallback_result);
+  original.write(dir / "libovrplatformloader.so");
+  auto hle = std::make_shared<HleLibrary>("libovrplatformloader.so");
+  hle::Handler override_handler = [](hle::CallContext &c) { c.return_x(hle_override_result); };
+#ifdef VENTURE_REPLACEMENT_FIXTURE_A32
+  hle::a32::register_adapter(hle->soname(), override_name, override_handler);
+#endif
+  const auto native = hle::make_thunk(hle->soname(), override_name, override_handler);
+  hle->add_function(override_name, native);
+  auto& linker = Linker::get();
+  linker.register_hle_library(hle);
+  linker.set_search_paths({dir.string()});
+  linker_set_inspection(false);
+  GuestThread thread(98);
+  thread.attach_to_current_host_thread();
+  auto* replacement = linker.open("libovrplatformloader.so", kRtldNow, nullptr);
+  REQUIRE(replacement != nullptr);
+  CHECK(replacement->mapped_image() == nullptr);
+  // The Java loader's JNI_OnLoad probe activates the backing before Gadget starts.
+  const auto fallback = linker.symbol(replacement, "JNI_OnLoad");
+  REQUIRE(fallback != 0);
+  auto* backing = replacement->mapped_image();
+  REQUIRE(backing != nullptr);
+  const auto frida_override = guest_export_address(*backing, override_name);
+  CHECK(linker.symbol(replacement, override_name) == native);
+  CHECK(frida_override == native);
+  CHECK(thread.call(frida_override, {}) == hle_override_result);
+  CHECK(guest_export_address(*backing, "JNI_OnLoad") == fallback);
+  CHECK(thread.call(fallback, {}) == original_fallback_result);
+  CHECK(linker.close(replacement) == 0);
+}
 TEST_CASE("replacement exports preserve originals without unrelated C++ fallback") {
 #ifdef VENTURE_REPLACEMENT_FIXTURE_A32
   select_process_isa(GuestIsa::a32);

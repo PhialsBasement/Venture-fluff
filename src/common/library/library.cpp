@@ -491,8 +491,8 @@ std::vector<std::string> missing_expansions(const Install &install) {
 }
 bool needed_meta_sign_in(const fs::path &log) {
   std::ifstream in(log, std::ios::binary);
-  bool init_failed = false, crashed_on_reply = false;
-  unsigned long long frames = 0;
+  bool init_failed = false, crashed_on_reply = false, direct_auth_failed = false;
+  unsigned long long frames = 0, direct_auth_frames = 0;
   double last = 0, refused = -1, first_poll = -1;
   // The newest log lines, true for each one that is an unanswered user poll.
   std::deque<bool> recent;
@@ -507,9 +507,13 @@ bool needed_meta_sign_in(const fs::path &log) {
       recent.push_back(poll);
       if (recent.size() > 200) recent.pop_front();
     }
-    if (line.find("[ovrplatform] ovr_User_GetLoggedInUser request=") != std::string::npos ||
-        line.find("[ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=") != std::string::npos)
-      if (line.find(" error=-20001") != std::string::npos) return true;
+    const bool direct_auth_request =
+        line.find("[ovrplatform] ovr_User_GetLoggedInUser request=") != std::string::npos ||
+        line.find("[ovrplatform] ovr_Entitlement_GetIsViewerEntitled request=") != std::string::npos;
+    if (direct_auth_request && line.find(" error=-20001") != std::string::npos && !direct_auth_failed) {
+      direct_auth_failed = true;
+      direct_auth_frames = frames;
+    }
     // Synchronous initialization logs its own line; the asynchronous one
     // completes as an ordinary request.
     if (line.find("[ovrplatform] initialization failed error=-20001") != std::string::npos ||
@@ -531,7 +535,13 @@ bool needed_meta_sign_in(const fs::path &log) {
   // asking for the user (Pinball FX shows black and polls ~45 times a second).
   const auto polls = std::count(recent.begin(), recent.end(), true);
   const bool waiting_for_user = recent.size() == 200 && polls >= 180 && last - first_poll >= 30;
-  return init_failed && (frames < 10 || crashed_on_reply || waiting_for_user);
+  // Response hooks may mask an error and supply the payload the game needs.
+  // Another 60 submitted frames prove that the game got past the direct error;
+  // do not blame its later, unrelated exit on the error it survived.
+  constexpr unsigned long long frames_proving_survival = 60;
+  const bool direct_unanswered = direct_auth_failed &&
+      (frames <= direct_auth_frames || frames - direct_auth_frames < frames_proving_survival);
+  return direct_unanswered || (init_failed && (frames < 10 || crashed_on_reply || waiting_for_user));
 }
 bool refused_entitlement(const fs::path &log) {
   std::ifstream in(log, std::ios::binary);
